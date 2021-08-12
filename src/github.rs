@@ -1,13 +1,14 @@
 use serde::de::DeserializeOwned;
-use std::io::Read;
 use rocket::Request;
-use rocket::data::{Outcome, FromDataSimple};
+use rocket::tokio::io::AsyncReadExt;
+use rocket::data::{Outcome, FromData, ToByteUnit};
 use rocket::http::{Status, ContentType};
 use sha2::Sha256;
 use hmac::{Hmac, Mac, NewMac};
 use serde_json as json;
 use hex;
 use octocrab::models::User;
+use crate::CONFIG;
 
 // TODO: this could be made easier using macro_rules
 #[derive(Serialize, Deserialize)]
@@ -16,22 +17,34 @@ pub struct EventPayloadCommon {
     pub action: String
 }
 
-pub struct GithubEvent<T> where T: DeserializeOwned {
-    pub name: String,
+pub struct SignedPayload<T> where T: DeserializeOwned + GithubEvent {
     pub payload: T,
 }
 
-type HmacSha256 = Hmac<Sha256>;
-const SECRET_ENV_VAR: &'static str = "GITHUB_WEBHOOK_SECRET";
+pub trait GithubEvent {
+    fn event_name() -> &'static str;
+}
 
-impl<T> FromDataSimple for GithubEvent<T> where T: DeserializeOwned {
+type HmacSha256 = Hmac<Sha256>;
+
+#[rocket::async_trait]
+impl<'r, T> FromData<'r> for SignedPayload<T> where T: DeserializeOwned + GithubEvent {
     type Error = String;
 
-    fn from_data(request: &Request, data: rocket::Data) -> Outcome<Self, Self::Error> {
+    async fn from_data(request: &'r Request<'_>, data: rocket::Data<'r>) -> Outcome<'r, Self> {
         // First check that this is json
         if request.content_type() != Some(&ContentType::JSON) {
             return Outcome::Failure((Status::UnprocessableEntity, String::from("Expecting JSON")));
         }
+
+        // Extract event name
+        if let Some(n) = request.headers().get_one("X-GitHub-Event") {
+            if <T as GithubEvent>::event_name() != n {
+                return Outcome::Forward(data);
+            }
+        } else {
+            return Outcome::Failure((Status::Unauthorized, String::from("Missing event name")));
+        };
 
         // Extract the tag
         let target_mac: Vec<u8> = if let Some(tgt) = request.headers().get_one("X-Hub-Signature-256") {
@@ -44,24 +57,25 @@ impl<T> FromDataSimple for GithubEvent<T> where T: DeserializeOwned {
             return Outcome::Failure((Status::Unauthorized, String::from("Missing signature")));
         };
 
-        // Extract event name
-        let name = if let Some(n) = request.headers().get_one("X-GitHub-Event") {
-            n.to_owned()
-        } else {
-            return Outcome::Failure((Status::Unauthorized, String::from("Missing event name")));
-        };
-
         // Create mac
-        let secret = std::env::var(SECRET_ENV_VAR).unwrap();
-        let mut mac = if let Ok(mac) = HmacSha256::new_from_slice(secret.as_bytes()) {
+        let mut mac = if let Ok(mac) = HmacSha256::new_from_slice(CONFIG.webhook_secret.as_bytes()) {
             mac
         } else {
             return Outcome::Failure((Status::InternalServerError, String::from("Unknown error")));
         };
 
         // Read data
-        let mut string = String::new();
-        data.open().read_to_string(&mut string).unwrap();
+        let string: String = match data.open(512.megabytes()).into_string().await {
+            Ok(str) => {
+                if !str.is_complete() {
+                    return Outcome::Failure((Status::InsufficientStorage, String::from("Request too big")));
+                }
+                str.into_inner()
+            },
+            Err(_) => {
+                return Outcome::Failure((Status::UnprocessableEntity, String::from("Impossible to get data")));
+            }
+        };
 
         // Verify MAC
         mac.update(string.as_bytes());
@@ -71,12 +85,10 @@ impl<T> FromDataSimple for GithubEvent<T> where T: DeserializeOwned {
 
         // Now deserialize everything
         match json::from_str::<T>(&string) {
-            Ok(payload) => Outcome::Success(GithubEvent { payload, name }),
-            Err(e) => {
-                eprintln!("Invalid data: {:?}", e);
+            Ok(payload) => Outcome::Success(SignedPayload { payload }),
+            Err(_) => {
                 return Outcome::Failure((Status::InternalServerError, String::from("Invalid data")))
             }
         }
     }
 }
-

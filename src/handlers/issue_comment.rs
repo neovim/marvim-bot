@@ -1,4 +1,4 @@
-use crate::github::EventPayloadCommon;
+use crate::github::{EventPayloadCommon, GithubEvent};
 use octocrab::models::issues::{Issue, Comment};
 
 #[derive(Serialize, Deserialize)]
@@ -7,4 +7,10 @@ pub struct IssueCommentEvent {
     pub common: EventPayloadCommon,
     pub comment: Comment,
     pub issue: Issue
+}
+
+impl GithubEvent for IssueCommentEvent {
+    fn event_name() -> &'static str {
+        "issue_comment"
+    }
 }
